@@ -65,14 +65,22 @@
 <script type="module">
 import * as THREE from 'three';
 import { ARButton } from 'three/addons/webxr/ARButton.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const ROT_STEP = THREE.MathUtils.degToRad(15);
 const DIST_STEP = 0.15; // metros
 const MIN_DIST = 0.3;
 const MAX_DIST = 6;
 
+// Si existe este archivo local (nunca se sube al repo público, ver .gitignore),
+// se carga en vez de la mesa de prueba. Ajusta MODEL_SCALE si el modelo real
+// se ve del tamaño incorrecto (los BIM suelen exportarse en unidades distintas a metros).
+const MODEL_URL = './models/modelo.glb';
+const MODEL_SCALE = 1;
+
 let camera, scene, renderer;
-let model, material, reticle;
+let model, reticle;
+let opacityMaterials = [];
 let locked = false;
 let followDistance = 1.2;
 let hitTestSource = null;
@@ -138,15 +146,18 @@ function init() {
     })
   );
 
-  material = new THREE.MeshStandardMaterial({
+  const placeholderMaterial = new THREE.MeshStandardMaterial({
     color: 0x2196f3,
     transparent: true,
     opacity: 0.6,
     side: THREE.DoubleSide
   });
-  model = buildTable(material);
+  model = buildTable(placeholderMaterial);
   model.visible = false;
+  opacityMaterials = [placeholderMaterial];
   scene.add(model);
+
+  loadRealModelIfPresent();
 
   reticle = new THREE.Mesh(
     new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
@@ -185,11 +196,52 @@ function init() {
   });
 
   document.getElementById('opacity').addEventListener('input', (e) => {
-    material.opacity = Number(e.target.value) / 100;
+    const value = Number(e.target.value) / 100;
+    opacityMaterials.forEach((m) => { m.opacity = value; });
   });
 
   window.addEventListener('resize', onWindowResize);
   renderer.setAnimationLoop(render);
+}
+
+// Intenta cargar 01-Proyectos/FieldAR2/models/modelo.glb (archivo local, nunca en git).
+// Si no existe (por ejemplo en la demo pública de GitHub Pages), sigue usando la mesa de prueba.
+function loadRealModelIfPresent() {
+  new GLTFLoader().load(
+    MODEL_URL,
+    (gltf) => {
+      const wasVisible = model.visible;
+      scene.remove(model);
+
+      const loaded = gltf.scene;
+      loaded.scale.setScalar(MODEL_SCALE);
+
+      opacityMaterials = [];
+      loaded.traverse((child) => {
+        if (child.isMesh) {
+          const materials = Array.isArray(child.material) ? child.material : [child.material];
+          const cloned = materials.map((m) => {
+            const c = m.clone();
+            c.transparent = true;
+            c.opacity = Number(document.getElementById('opacity').value) / 100;
+            c.side = THREE.DoubleSide;
+            return c;
+          });
+          child.material = Array.isArray(child.material) ? cloned : cloned[0];
+          opacityMaterials.push(...cloned);
+        }
+      });
+
+      model = loaded;
+      model.visible = wasVisible;
+      scene.add(model);
+      infoEl.textContent = 'Modelo BIM real cargado.';
+    },
+    undefined,
+    () => {
+      // No hay modelo real en esta carpeta: se queda con la mesa de prueba, sin error visible.
+    }
+  );
 }
 
 function setLocked(value) {
