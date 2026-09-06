@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FieldAR2 - Prueba WebAR</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  #info {
+    position: absolute; top: 0; left: 0; width: 100%;
+    text-align: center; padding: 10px; z-index: 10;
+    font-family: system-ui, sans-serif; color: #fff; font-size: 13px;
+    background: rgba(0,0,0,0.55); pointer-events: none;
+  }
+  #panel {
+    position: absolute; bottom: 0; left: 0; width: 100%;
+    display: none; flex-direction: column; gap: 8px;
+    padding: 10px 10px calc(env(safe-area-inset-bottom, 0px) + 10px);
+    background: rgba(0,0,0,0.55);
+    font-family: system-ui, sans-serif; color: #fff; box-sizing: border-box;
+  }
+  #panel.visible { display: flex; }
+  .row { display: flex; gap: 6px; justify-content: center; }
+  button {
+    flex: 1; padding: 12px 6px; font-size: 16px; border-radius: 8px;
+    border: none; color: #fff; touch-action: manipulation;
+  }
+  #lockBtn { padding: 16px; font-size: 17px; font-weight: bold; }
+  #lockBtn.unlocked { background: #ff9800; }
+  #lockBtn.locked { background: #43a047; }
+  .secondary { background: #2196f3; }
+  .secondary:disabled { background: #555; opacity: 0.5; }
+  .opacity-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .opacity-row input { flex: 1; }
+</style>
+</head>
+<body>
+<div id="info">Entra al modo AR con el botón de abajo</div>
+
+<div id="panel">
+  <button id="lockBtn" class="unlocked">🔓 DESFIJADO — toca para FIJAR aquí</button>
+  <div class="row">
+    <button class="secondary" data-dist="acercar">🔍+ acercar</button>
+    <button class="secondary" data-dist="alejar">🔍- alejar</button>
+  </div>
+  <div class="row">
+    <button class="secondary" data-rot="left">↺ girar</button>
+    <button class="secondary" data-rot="right">↻ girar</button>
+  </div>
+  <div class="opacity-row">
+    <span>Transparencia</span>
+    <input id="opacity" type="range" min="10" max="100" value="60">
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+const ROT_STEP = THREE.MathUtils.degToRad(15);
+const DIST_STEP = 0.15; // metros
+const MIN_DIST = 0.3;
+const MAX_DIST = 6;
+
+let camera, scene, renderer;
+let model, material, reticle;
+let locked = false;
+let followDistance = 1.2;
+let hitTestSource = null;
+let hitTestSourceRequested = false;
+let lastAnchored = null; // para no reescribir el texto cada frame sin necesidad
+
+const infoEl = document.getElementById('info');
+const panelEl = document.getElementById('panel');
+const lockBtn = document.getElementById('lockBtn');
+const distButtons = document.querySelectorAll('[data-dist]');
+
+init();
+
+// Mesa simple: tapa + 4 patas, medidas típicas de una mesa de trabajo (0.8 x 0.5m, 0.45m alto)
+function buildTable(sharedMaterial) {
+  const group = new THREE.Group();
+
+  const topWidth = 0.8, topDepth = 0.5, topThickness = 0.03;
+  const legSize = 0.03, legHeight = 0.42;
+  const tableHeight = legHeight + topThickness;
+
+  const top = new THREE.Mesh(
+    new THREE.BoxGeometry(topWidth, topThickness, topDepth),
+    sharedMaterial
+  );
+  top.position.y = tableHeight - topThickness / 2;
+  group.add(top);
+
+  const legGeometry = new THREE.BoxGeometry(legSize, legHeight, legSize);
+  const offsetX = topWidth / 2 - legSize / 2 - 0.02;
+  const offsetZ = topDepth / 2 - legSize / 2 - 0.02;
+  [
+    [offsetX, offsetZ], [-offsetX, offsetZ],
+    [offsetX, -offsetZ], [-offsetX, -offsetZ]
+  ].forEach(([x, z]) => {
+    const leg = new THREE.Mesh(legGeometry, sharedMaterial);
+    leg.position.set(x, legHeight / 2, z);
+    group.add(leg);
+  });
+
+  return group;
+}
+
+function init() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.5);
+  light.position.set(0.5, 1, 0.25);
+  scene.add(light);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  document.body.appendChild(
+    ARButton.createButton(renderer, {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay'],
+      domOverlay: { root: document.body }
+    })
+  );
+
+  material = new THREE.MeshStandardMaterial({
+    color: 0x2196f3,
+    transparent: true,
+    opacity: 0.6,
+    side: THREE.DoubleSide
+  });
+  model = buildTable(material);
+  model.visible = false;
+  scene.add(model);
+
+  reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+  );
+  reticle.visible = false;
+  scene.add(reticle);
+
+  renderer.xr.addEventListener('sessionstart', () => {
+    panelEl.classList.add('visible');
+    model.visible = true;
+    setLocked(false);
+    infoEl.textContent = 'Apunta a la superficie: círculo VERDE = anclado real. Sin círculo = ubicación manual (revisa girando antes de fijar).';
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    panelEl.classList.remove('visible');
+    infoEl.textContent = 'Entra al modo AR con el botón de abajo';
+    hitTestSourceRequested = false;
+    hitTestSource = null;
+  });
+
+  lockBtn.addEventListener('click', () => setLocked(!locked));
+
+  distButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (locked) return;
+      const delta = btn.dataset.dist === 'acercar' ? -DIST_STEP : DIST_STEP;
+      followDistance = THREE.MathUtils.clamp(followDistance + delta, MIN_DIST, MAX_DIST);
+    });
+  });
+
+  document.querySelectorAll('[data-rot]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      model.rotateY(btn.dataset.rot === 'left' ? ROT_STEP : -ROT_STEP);
+    });
+  });
+
+  document.getElementById('opacity').addEventListener('input', (e) => {
+    material.opacity = Number(e.target.value) / 100;
+  });
+
+  window.addEventListener('resize', onWindowResize);
+  renderer.setAnimationLoop(render);
+}
+
+function setLocked(value) {
+  locked = value;
+  lockBtn.classList.toggle('unlocked', !locked);
+  lockBtn.classList.toggle('locked', locked);
+  lockBtn.textContent = locked
+    ? '🔒 FIJADO — toca para DESFIJAR y mover'
+    : '🔓 DESFIJADO — toca para FIJAR aquí';
+  distButtons.forEach((btn) => (btn.disabled = locked));
+
+  if (!locked) {
+    // Al desfijar, retoma el seguimiento desde la distancia actual real a la cámara
+    // para que el cilindro no salte de golpe.
+    followDistance = THREE.MathUtils.clamp(camera.position.distanceTo(model.position), MIN_DIST, MAX_DIST);
+  }
+}
+
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function render(timestamp, frame) {
+  let hitPoint = null;
+
+  if (frame) {
+    const referenceSpace = renderer.xr.getReferenceSpace();
+    const session = renderer.xr.getSession();
+
+    if (!hitTestSourceRequested) {
+      hitTestSourceRequested = true;
+      session.requestReferenceSpace('viewer').then((viewerSpace) => {
+        const request = (options) =>
+          session.requestHitTestSource(options).then((source) => { hitTestSource = source; });
+        // Intenta anclar también a puntos de la estructura (no solo pisos/planos);
+        // si el navegador no soporta entityTypes, cae al modo básico (solo planos).
+        request({ space: viewerSpace, entityTypes: ['plane', 'point'] })
+          .catch(() => request({ space: viewerSpace }));
+      });
+      session.addEventListener('end', () => {
+        hitTestSourceRequested = false;
+        hitTestSource = null;
+      });
+    }
+
+    if (hitTestSource) {
+      const results = frame.getHitTestResults(hitTestSource);
+      if (results.length > 0) {
+        const pos = results[0].getPose(referenceSpace).transform.position;
+        hitPoint = new THREE.Vector3(pos.x, pos.y, pos.z);
+      }
+    }
+  }
+
+  reticle.visible = !!hitPoint;
+  if (hitPoint) reticle.position.copy(hitPoint);
+
+  if (!locked && model.visible) {
+    if (hitPoint) {
+      model.position.copy(hitPoint);
+      followDistance = THREE.MathUtils.clamp(camera.position.distanceTo(hitPoint), MIN_DIST, MAX_DIST);
+    } else {
+      const dir = new THREE.Vector3();
+      camera.getWorldDirection(dir);
+      model.position.copy(camera.position).addScaledVector(dir, followDistance);
+    }
+  }
+
+  const anchored = !!hitPoint;
+  if (!locked && anchored !== lastAnchored) {
+    lastAnchored = anchored;
+    infoEl.textContent = anchored
+      ? '🟢 Anclado a una superficie real detectada.'
+      : '🟠 Sin superficie detectada — ubicación manual. Usa acercar/alejar y verifica girando antes de fijar.';
+  }
+
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
